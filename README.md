@@ -489,6 +489,8 @@ docker run -p 8080:8080 -v "$(pwd)/graphify-out:/data" graphify \
 
 These are only needed for **headless / CI extraction** (`graphify extract`). When running via the `/graphify` skill inside your IDE, the model API is provided by your IDE session — no extra keys needed.
 
+When using the CLI or MCP server from a project directory, Graphify automatically loads that directory's `.env` file. Existing shell environment variables take precedence.
+
 | Variable | Used for | When required |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | Claude (Anthropic) backend | `--backend claude` |
