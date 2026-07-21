@@ -166,6 +166,7 @@ const network = new vis.Network(container, {{ nodes: nodesDS, edges: edgesDS }},
 
 network.once('stabilizationIterationsDone', () => {{
   network.setOptions({{ physics: {{ enabled: false }} }});
+  applyPreviewHash();
 }});
 
 function showInfo(nodeId) {{
@@ -192,6 +193,115 @@ function focusNode(nodeId) {{
   network.selectNodes([nodeId]);
   showInfo(nodeId);
 }}
+
+// Deep links are handled in the generated page so the complete interactive
+// graph remains available after a focused preview is opened.
+function previewMessage(message) {{
+  const panel = document.getElementById('info-content');
+  panel.innerHTML = `<span class="empty">${{esc(message)}}</span>`;
+}}
+
+function resolvePreviewNode(value) {{
+  const raw = String(value || '');
+  const byId = nodesDS.get(raw);
+  if (byId) return byId;
+  const exact = RAW_NODES.filter(n => String(n.label) === raw);
+  if (exact.length === 1) return nodesDS.get(exact[0].id);
+  const folded = RAW_NODES.filter(n => String(n.label).toLowerCase() === raw.toLowerCase());
+  return folded.length === 1 ? nodesDS.get(folded[0].id) : null;
+}}
+
+function clearPreviewHighlight() {{
+  nodesDS.update(RAW_NODES.map(n => ({{ id: n.id, opacity: 1, color: n.color }})));
+  edgesDS.update(RAW_EDGES.map((e, i) => ({{ id: i, width: e.width, color: e.color }})));
+}}
+
+function previewPath(source, target) {{
+  const sourceNode = resolvePreviewNode(source);
+  const targetNode = resolvePreviewNode(target);
+  if (!sourceNode || !targetNode) {{
+    previewMessage(`Could not resolve preview path: ${{source}} -> ${{target}}`);
+    return;
+  }}
+  const sourceId = String(sourceNode.id);
+  const targetId = String(targetNode.id);
+  const adjacency = new Map();
+  RAW_NODES.forEach(n => adjacency.set(String(n.id), []));
+  RAW_EDGES.forEach((edge, index) => {{
+    const from = String(edge.from);
+    const to = String(edge.to);
+    if (!adjacency.has(from)) adjacency.set(from, []);
+    if (!adjacency.has(to)) adjacency.set(to, []);
+    adjacency.get(from).push([to, index]);
+    adjacency.get(to).push([from, index]);
+  }});
+  const queue = [sourceId];
+  const parent = new Map([[sourceId, null]]);
+  const parentEdge = new Map();
+  while (queue.length && !parent.has(targetId)) {{
+    const current = queue.shift();
+    (adjacency.get(current) || []).forEach(([next, edgeIndex]) => {{
+      if (parent.has(next)) return;
+      parent.set(next, current);
+      parentEdge.set(next, edgeIndex);
+      queue.push(next);
+    }});
+  }}
+  if (!parent.has(targetId)) {{
+    previewMessage(`No path found between ${{source}} and ${{target}}.`);
+    return;
+  }}
+  const pathNodes = [];
+  const pathEdges = [];
+  for (let node = targetId; node !== null; node = parent.get(node)) {{
+    pathNodes.unshift(node);
+    if (parentEdge.has(node)) pathEdges.unshift(parentEdge.get(node));
+  }}
+  const pathNodeSet = new Set(pathNodes);
+  const pathEdgeSet = new Set(pathEdges);
+  nodesDS.update(RAW_NODES.map(n => ({{
+    id: n.id,
+    opacity: pathNodeSet.has(String(n.id)) ? 1 : 0.2,
+    color: pathNodeSet.has(String(n.id)) ? {{
+      background: n.color.background,
+      border: '#facc15',
+      highlight: {{ background: '#ffffff', border: '#facc15' }},
+    }} : n.color,
+  }})));
+  edgesDS.update(RAW_EDGES.map((e, i) => ({{
+    id: i,
+    width: pathEdgeSet.has(i) ? Math.max(4, e.width || 1) : e.width,
+    color: pathEdgeSet.has(i) ? {{ color: '#facc15', opacity: 1 }} : {{ color: '#555', opacity: 0.12 }},
+  }})));
+  network.selectNodes(pathNodes);
+  network.selectEdges(pathEdges);
+  network.fit({{ nodes: pathNodes, animation: true }});
+  showInfo(sourceNode.id);
+}}
+
+function applyPreviewHash() {{
+  const hash = window.location.hash.slice(1);
+  if (!hash) return;
+  try {{
+    if (hash.startsWith('node=')) {{
+      const value = decodeURIComponent(hash.slice(5));
+      const node = resolvePreviewNode(value);
+      if (!node) {{ previewMessage(`Graphify node not found: ${{value}}`); return; }}
+      clearPreviewHighlight();
+      focusNode(node.id);
+      return;
+    }}
+    if (hash.startsWith('path=')) {{
+      const values = hash.slice(5).split('&');
+      if (values.length !== 2) {{ previewMessage('Invalid Graphify path preview link.'); return; }}
+      previewPath(decodeURIComponent(values[0]), decodeURIComponent(values[1]));
+    }}
+  }} catch (error) {{
+    previewMessage('Invalid Graphify preview link.');
+  }}
+}}
+
+window.addEventListener('hashchange', applyPreviewHash);
 
 // Neighbor links use a data attribute + one delegated listener rather than an
 // inline onclick. A node id/label sourced from a document or a scraped URL
