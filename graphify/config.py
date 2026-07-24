@@ -8,9 +8,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+_GRAPHIFY_ROOT = Path(__file__).resolve().parents[1]
+
+
 def load_project_environment() -> bool:
-    """Load the current project's ``.env`` without overriding shell variables."""
-    dotenv_path = Path.cwd() / ".env"
+    """Load project ``.env``, falling back to Graphify's own configuration."""
+    project_dotenv = Path.cwd() / ".env"
+    dotenv_path = project_dotenv if project_dotenv.is_file() else _GRAPHIFY_ROOT / ".env"
     if not dotenv_path.is_file():
         return False
     previous_disable_level = logging.root.manager.disable
