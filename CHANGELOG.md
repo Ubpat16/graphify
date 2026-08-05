@@ -2,6 +2,48 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## 0.9.33 (unreleased)
+
+- Fix: the C# `partial class` merge (#2332) no longer conflates two same-named classes that live in different assemblies (#2411, thanks @JensD-git). The merge now keys on assembly (nearest ancestor directory containing a `.csproj`/`.fsproj`/`.vbproj`) in addition to namespace and name, so genuine partial halves within one project still merge while same-name types in separate projects stay distinct. A corpus with no project file keeps merging by namespace and name as before.
+- Fix: `graphify update` no longer drops member-call and `indirect_call` edges from a changed file into an unchanged target (#2437, #2438, thanks @aryanbonigala). Incremental re-resolution now sees the unchanged corpus (its nodes, `contains`/`method` edges, and the `_callable` markers, which now persist to `graph.json` like `_origin`), so cross-file calls survive an incremental rebuild while edges to a genuinely removed target are still evicted.
+- Fix: `graphify extract` no longer silently substitutes an empty result when a worker crashes (#2444, #2445, thanks @Baziar). A `BrokenProcessPool` now triggers the sequential fallback instead of being swallowed per future, a failed worker file is retried sequentially rather than merged as empty, and a whole-pass AST failure on a fresh build exits non-zero instead of writing a zero-node graph (use `--allow-partial` to opt into a best-effort partial graph).
+- `graphify install` now prints a one-time pointer to the hosted platform (early access is open free before the public v1 launch) after the setup summary.
+
+## 0.9.32 (2026-08-01)
+
+- Fix: incremental extraction and `_rebuild_code` no longer drop a file's other tier (#2333, #2334, #2336). Node/edge ownership was keyed on `source_file` alone, so a semantic re-extract deleted a doc's AST headings and a full rebuild deleted document AST nodes. Merge is now tier-aware (an AST re-extract replaces only AST nodes and keeps the semantic layer, and vice versa), the `_origin` provenance marker is backfilled on load so old graphs self-heal, and the full-rebuild drop is scoped to sources actually regenerated.
+- Fix: `graphify update` preserves the graph's `directed` flag instead of rebuilding it undirected (#2342, thanks @Rishet11), so God-node / path ranking keeps its direction on both the clustered and `--no-cluster` rebuild paths.
+- Fix: a numeric or otherwise non-string node id from an LLM fragment no longer aborts the build with a TypeError (#2326, thanks @Rishet11); ids are coerced consistently across nodes, edges, and hyperedges.
+- Fix: `graphify query` renders every edge between visited nodes, not just the traversal-tree edges, so the returned subgraph matches the real induced subgraph (#2323, thanks @Rishet11).
+- Fix: `graphify update` writes `manifest.json` to the target's `graphify-out` instead of the current working directory (#2316, thanks @Rishet11), so running it from elsewhere can no longer prune the target's own manifest rows.
+- Fix: a real Python package named `coverage/` is no longer silently dropped; the prune is gated on coverage-report artefacts (#2339, thanks @Manoj21k).
+- Fix: a custom `GRAPHIFY_OUT` name no longer prunes every same-named directory in the tree; only the configured output path is excluded (#2273, thanks @oleksii-tumanov).
+- Fix: C# member calls resolve for receivers declared inline via `out var`, `is`, `case`, and switch-arm patterns (#2346, thanks @JensD-git), and members of a `partial class` split across files now attach to one merged class node so cross-half calls resolve (#2332).
+- Fix: members of a Kotlin anonymous object (`object : Foo { ... }`) are now extracted, with their `implements` and `calls` edges (#2347).
+- Fix: Ruby mixins declared with compact/nested syntax now resolve, and a qualified external mixin can no longer fabricate a phantom hub (#2302, thanks @FolatheDuckofDuckingburg). `module Foo::Bar` and `module Foo; module Bar` are canonicalized to the same fully-qualified label, and `include`/`extend`/`prepend` keep the full constant path, so `include Foo::Bar` resolves. Mixin resolution is now scoped and lexical: a qualified external name like `extend ActiveSupport::Concern` no longer binds to any local module named `Concern`, while a genuine in-corpus `include Foo::Concern` still resolves. Nested-declared classes keep their last-segment index so typed-receiver calls (`Processor.new`) continue to resolve.
+- Perf: dedup drops an O(nodes x components) scan in remap construction (#2328, thanks @stupidprogrammer4), with identical results.
+
+## 0.9.31 (2026-07-30)
+
+- Feature: the MCP server is dual-compatible with SDK 1.x AND 2.x (#2308, thanks @NiSHoW), lifting the `mcp<2` cap 0.9.30 introduced to `mcp>=1,<3`. The 2.0 SDK removed the low-level decorator API (`Server.list_tools`/`call_tool`/...); `_build_server` now binds the same handlers via the 1.x decorators or the 2.x `on_*` constructor callbacks, picked at runtime, and adapts `Tool.inputSchema`, `Resource.uri` (plain `str` in 2.x), and the dropped `AnyUrl` re-export. Verified with full stdio handshakes under both mcp 1.29 and 2.0.
+- Fix: C# member calls on a typed receiver no longer drop true `calls` edges when the same local name is reused across methods (#2299, thanks @JensD-git). Receiver typing was per-file and poisoned a name on any conflicting/untypable rebind anywhere in the file; it is now per-method (mirroring the Java resolver), so an untypable `var x = ...` in one method can't delete a typed-parameter call edge in another.
+- Fix: SQL cross-file table references (e.g. a prisma migration referencing a table created in an earlier one) resolve to the real table node instead of leaking an absolute-path id and losing the foreign key (#2324). References now mint a sourceless stub that collapses onto the real definition, and identifiers are normalized so a quoted definition (`"public"."users"`) matches an unquoted reference (`public.users`).
+- Fix: `graphify path` and `explain` no longer print reversed hops (#2309). They now recover edge direction from the stored `_src`/`_tgt` markers instead of the persisted endpoint order, so a graph.json written with flipped storage order (older graphs, raw dumps, merge-driver output) renders the true direction.
+- Fix: `export const X = <scalar>` now emits a graph node, so a named import of a scalar export is no longer left dangling (#2266, thanks @oleksii-tumanov).
+- Fix: Go predeclared functions (`make`, `len`, `append`, `new`, ...) no longer fabricate call edges to same-named user symbols (#2313, thanks @PathGao); the filter is scoped to Go bare-identifier callees so it can't affect other languages or same-file method calls.
+- Fix: `graphify explain` refuses and lists candidates when a name matches symbols in more than one file, instead of silently resolving to an arbitrary one (#2233, thanks @0bLoM).
+- Fix: the Antigravity install workflow no longer hardcodes the global skill path for a project-scoped install (#2319, thanks @MalikHaroonKhokhar).
+
+## 0.9.30 (2026-07-29)
+
+- Fix: pin `mcp` below 2.0 so a fresh `graphifyy[mcp]` / `graphifyy[all]` install works again (#2277, #2279, #2291). The `mcp` 2.0.0 major dropped the `mcp.types.AnyUrl` re-export and the `Server` decorator-registration API that `graphify/serve.py` uses, so an unpinned resolve broke `graphify-mcp` on every new install with an `ImportError`. The `mcp` and `all` extras now require `mcp>=1,<2` (resolving to 1.29.0) and `starlette>=1.3.1,<2`. Adapting to the mcp 2.x API is tracked as a follow-up.
+- Fix: TypeScript `.tsx` files no longer leak absolute-path / machine-slug ids into edge endpoints (#2262). The symbol-resolution pass parsed `.tsx` with the plain TypeScript grammar, so JSX misparsed and nested handlers floated to top level, emitting `calls` edges whose source was an absolute-stem id for a caller with no node. `.tsx` now uses the TSX grammar, a `calls` edge is never emitted from an unowned source, and a general backstop canonicalizes any node-less absolute-derived endpoint.
+- Fix: a warm AST-cache hit after a corpus move/clone no longer replays node ids minted under the original root (#2257, thanks @Kaushik2003). Cached ids are stored root-relative and re-anchored on read, matching the manifest/stat-index portability contracts.
+- Fix: the Bedrock backend reads the first *text* block of a Converse response instead of blindly indexing block 0, so reasoning-capable models (which emit a reasoning block first) no longer parse to zero nodes (#2287, thanks @zhiyanliu).
+- Fix: the Bedrock backend honors `GRAPHIFY_API_TIMEOUT` (and `GRAPHIFY_MAX_RETRIES`) instead of botocore's silent 60s default, so long generations no longer die with a read timeout (#2284, thanks @zhiyanliu).
+- Fix: `merge-graphs` preserves edge direction instead of rewiring import edges to the importing file (#2261, thanks @hopstreax).
+- Fix: the MCP server's multi-project graph-context cache is now bounded (LRU, default 8 via `GRAPHIFY_MAX_CONTEXTS`) instead of growing unbounded per project (#2268, thanks @Kkartik14).
+
 ## 0.9.29 (2026-07-28)
 
 - Fix: absolute-path / machine-slug node ids no longer leak into edge endpoints (#2231, #2243). Module-top-level `indirect_call` sources, bash `source`/script-invocation targets, and other producers that minted an id from an absolute path are now canonicalized to the root-relative node id by a general backstop, so `graph.json` link endpoints are portable across machines and clones.

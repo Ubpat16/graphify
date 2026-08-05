@@ -914,10 +914,17 @@ def dispatch_command(cmd: str) -> None:
             # a seed with no outgoing edges. Direction is instead preserved
             # per-edge below (mirrors graphify/build.py's _src/_tgt pattern)
             # so the *rendering* stays correct without narrowing traversal.
+            # Keep in-file markers when present (#2309): unconditionally
+            # overwriting them with source/target would clobber the true
+            # direction of a link persisted in flipped endpoint order.
             _raw = dict(
                 _raw,
                 links=[
-                    {**link, "_src": link.get("source"), "_tgt": link.get("target")}
+                    {
+                        **link,
+                        "_src": link.get("_src", link.get("source")),
+                        "_tgt": link.get("_tgt", link.get("target")),
+                    }
                     for link in _raw.get("links", [])
                 ],
             )
@@ -1259,12 +1266,19 @@ def dispatch_command(cmd: str) -> None:
             # direction — never a fabricated `calls` (#2074). A pair may carry
             # several parallel relations; show all, and fall back to an honest
             # "related" when the stored edge has no relation.
-            if G.has_edge(u, v):
-                datas = edge_datas(G, u, v)
-                forward = True
-            else:
-                datas = edge_datas(G, v, u)
-                forward = False
+            # Direction truth lives in the per-link _src/_tgt markers (#2309):
+            # undirected NetworkX storage canonicalizes endpoint order, so the
+            # persisted source/target arc can be flipped relative to the real
+            # caller→callee direction. Recover it from _src when present, else
+            # fall back to the loaded arc tail (markerless canonical files keep
+            # today's behavior).
+            fwd, bwd = [], []
+            for a, b in ((u, v), (v, u)):
+                if G.has_edge(a, b):
+                    for d in edge_datas(G, a, b):
+                        (fwd if d.get("_src", a) == u else bwd).append(d)
+            datas = fwd or bwd
+            forward = bool(fwd)
             rels = sorted({d.get("relation") for d in datas if d.get("relation")})
             rel = "/".join(rels) if rels else "related"
             confs = sorted({d.get("confidence") for d in datas if d.get("confidence")})
@@ -1289,7 +1303,7 @@ def dispatch_command(cmd: str) -> None:
         if len(sys.argv) < 3:
             print('Usage: graphify explain "<node>" [--graph path]', file=sys.stderr)
             sys.exit(1)
-        from graphify.serve import _find_node
+        from graphify.serve import _find_node, find_node_ambiguity
         from networkx.readwrite import json_graph
 
         label = sys.argv[2]
@@ -1316,6 +1330,14 @@ def dispatch_command(cmd: str) -> None:
         if not matches:
             print(f"No node matching '{label}' found.")
             sys.exit(0)
+        rivals = find_node_ambiguity(G, label)
+        if rivals:
+            print(f"Ambiguous: '{label}' matches {len(rivals)} nodes in different files.")
+            for rival in rivals:
+                print(f"  {G.nodes[rival].get('source_file') or rival}")
+                print(f"    id: {rival}")
+            print("Retry with the repo-relative path or the full node id.")
+            sys.exit(1)
         nid = matches[0]
         d = G.nodes[nid]
         print(f"Node: {d.get('label', nid)}")
@@ -1352,10 +1374,20 @@ def dispatch_command(cmd: str) -> None:
         print(f"  Degree:    {G.degree(nid)}")
         from graphify.build import edge_data
         connections: list[tuple[str, str, dict]] = []  # (direction, neighbor_id, edge_data)
+        # Classify by the edge's TRUE direction, not the loaded arc order:
+        # a link persisted in flipped endpoint order carries its truth in the
+        # per-edge _src marker (#2309). Markerless edges fall back to the arc
+        # tail (today's behavior).
         for nb in G.successors(nid):
-            connections.append(("out", nb, edge_data(G, nid, nb)))
+            _ed = edge_data(G, nid, nb)
+            connections.append(
+                ("out" if _ed.get("_src", nid) == nid else "in", nb, _ed)
+            )
         for nb in G.predecessors(nid):
-            connections.append(("in", nb, edge_data(G, nb, nid)))
+            _ed = edge_data(G, nb, nid)
+            connections.append(
+                ("in" if _ed.get("_src", nb) == nb else "out", nb, _ed)
+            )
         if connections:
             print(f"\nConnections ({len(connections)}):")
             connections.sort(key=lambda c: G.degree(c[1]), reverse=True)
@@ -2093,6 +2125,22 @@ def dispatch_command(cmd: str) -> None:
             # via node_link_data but older runs may have used "edges" (#738).
             if "links" not in data and "edges" in data:
                 data = dict(data, links=data["edges"])
+            # Preserve stored edge direction across undirected node_link_graph (#2261).
+            # Mirrors cli.py's query pattern and export.py's _src/_tgt restoration.
+            # Keep in-file markers when present (#2309): unconditionally
+            # overwriting them with source/target would clobber the true
+            # direction of a link persisted in flipped endpoint order.
+            data = dict(
+                data,
+                links=[
+                    {
+                        **link,
+                        "_src": link.get("_src", link.get("source")),
+                        "_tgt": link.get("_tgt", link.get("target")),
+                    }
+                    for link in data.get("links", [])
+                ],
+            )
             try:
                 G = _jg.node_link_graph(data, edges="links")
             except TypeError:
@@ -2129,6 +2177,13 @@ def dispatch_command(cmd: str) -> None:
             out_data = _jg.node_link_data(merged, edges="links")
         except TypeError:
             out_data = _jg.node_link_data(merged)
+        # Restore original edge direction from _src/_tgt markers (same pattern as export.py #563/#2261)
+        for link in out_data.get("links", []):
+            tsrc = link.pop("_src", None)
+            ttgt = link.pop("_tgt", None)
+            if tsrc is not None and ttgt is not None:
+                link["source"] = tsrc
+                link["target"] = ttgt
         out_path.parent.mkdir(parents=True, exist_ok=True)
         from graphify.paths import write_json_atomic as _wja
         _wja(out_path, out_data, indent=2)
@@ -3036,11 +3091,100 @@ def dispatch_command(cmd: str) -> None:
             ast_kwargs: dict = {"cache_root": out_root, "root": target}
             if cli_max_workers is not None:
                 ast_kwargs["max_workers"] = cli_max_workers
+            # #2437/#2438 (the `graphify update` twin of watch's #2406 fix): an
+            # incremental re-scan extracts only the changed code files, so the
+            # cross-file resolvers cannot see a callee living in an unchanged
+            # file and every changed->unchanged call edge silently vanished on
+            # merge. Hand extract() read-only resolution context from the
+            # persisted graph: its AST-tier nodes (with their `_callable`/
+            # `_callable_class` markers, #2438) plus the contains/method edges
+            # the member-call resolvers walk (#2437), scoped to the UNCHANGED
+            # live corpus — never a re-extracted, deleted, or excluded file, so
+            # stale symbols cannot resurrect. Fails open (changed-batch-only
+            # resolution, the pre-fix behavior) on an unreadable graph.
+            if incremental_mode and existing_graph_path.exists():
+                _ctx_nodes: list[dict] = []
+                _ctx_edges: list[dict] = []
+                try:
+                    from graphify.build import _is_ast_tier as _ctx_is_ast_tier
+                    from graphify.security import (
+                        check_graph_file_size_cap as _ctx_size_cap,
+                    )
+                    _ctx_size_cap(existing_graph_path)
+                    _ctx_graph = json.loads(
+                        existing_graph_path.read_text(encoding="utf-8")
+                    )
+                    _ctx_root = Path(os.path.abspath(target))
+
+                    def _ctx_identity(source_file) -> str | None:
+                        # graph.json source_file values are relative to the
+                        # scanned root (`root=target` above); detect's
+                        # unchanged_files keep their scan-time form. Compare
+                        # both as absolute posix paths.
+                        if not source_file:
+                            return None
+                        _p = Path(str(source_file))
+                        if not _p.is_absolute():
+                            _p = _ctx_root / _p
+                        return Path(os.path.abspath(_p)).as_posix()
+
+                    _ctx_live = {
+                        _ctx_identity(f)
+                        for _flist in detection.get("unchanged_files", {}).values()
+                        for f in _flist
+                    }
+                    _ctx_live.discard(None)
+                    for _node in _ctx_graph.get("nodes", []):
+                        if not _node.get("id") or not _ctx_is_ast_tier(_node):
+                            continue
+                        _sf = _node.get("source_file")
+                        if not _sf or _ctx_identity(_sf) not in _ctx_live:
+                            continue
+                        _ctx_node = {
+                            "id": _node["id"],
+                            "label": _node.get("label"),
+                            "source_file": _sf,
+                            "file_type": _node.get("file_type"),
+                            "type": _node.get("type"),
+                        }
+                        for _marker in ("_callable", "_callable_class"):
+                            if _node.get(_marker):
+                                _ctx_node[_marker] = _node[_marker]
+                        _ctx_nodes.append(_ctx_node)
+                    for _edge in _ctx_graph.get(
+                        "links", _ctx_graph.get("edges", [])
+                    ):
+                        if _edge.get("relation") not in ("contains", "method"):
+                            continue
+                        if not _ctx_is_ast_tier(_edge):
+                            continue
+                        _sf = _edge.get("source_file")
+                        if not _sf or _ctx_identity(_sf) not in _ctx_live:
+                            continue
+                        _ctx_edges.append({
+                            "source": _edge.get("source"),
+                            "target": _edge.get("target"),
+                            "relation": _edge.get("relation"),
+                            "source_file": _sf,
+                        })
+                except Exception:
+                    _ctx_nodes, _ctx_edges = [], []
+                if _ctx_nodes:
+                    ast_kwargs["resolution_context_nodes"] = _ctx_nodes
+                if _ctx_edges:
+                    ast_kwargs["resolution_context_edges"] = _ctx_edges
             print(f"[graphify extract] AST extraction on {len(code_files)} code files...")
             try:
                 ast_result = _ast_extract(code_files, **ast_kwargs)
             except Exception as exc:
                 print(f"[graphify extract] AST extraction failed: {exc}", file=sys.stderr)
+                # #2445: losing the whole AST pass is fatal by default. The
+                # empty stand-in only reaches the shrink guard when an existing
+                # graph is larger — on a fresh build it used to be written as a
+                # 0-node graph with exit 0, indistinguishable from success.
+                # --allow-partial opts back into the best-effort continuation.
+                if not cli_allow_partial:
+                    sys.exit(1)
                 ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
                 _extraction_incomplete = True  # the whole AST pass was lost
         stages.mark("AST extract")
