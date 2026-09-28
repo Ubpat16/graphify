@@ -5,12 +5,14 @@ from graphify.exporters.base import COMMUNITY_COLORS  # noqa: E402,F401
 from pathlib import Path
 import html as _html
 from graphify.analyze import _node_community_map
+from graphify.paths import write_text_atomic
 import json
 import networkx as nx
 from graphify.security import sanitize_label
 
 
 MAX_NODES_FOR_VIZ = 5_000
+_HTML_STALE_MARKER = ".graph.html.stale"
 
 def _viz_node_limit() -> int:
     """Return the effective viz node limit, honoring GRAPHIFY_VIZ_NODE_LIMIT env var.
@@ -146,9 +148,15 @@ function esc(s) {{
 }}
 
 // Build vis datasets
-const nodesDS = new vis.DataSet(RAW_NODES.map(n => ({{
+const nodesDS = new vis.DataSet(RAW_NODES.map((n, i) => ({{
   id: n.id, label: n.label, color: n.color, size: n.size,
   font: n.font, title: n.title,
+  // Fermat/golden-angle spiral seed positions (#3699): spreading nodes out
+  // before physics runs keeps avoidOverlap from computing near-zero-distance
+  // repulsion that blows the BarnesHut recursion into a stack overflow on large
+  // graphs. `i` is the map index — physics still settles small graphs identically.
+  x: 30 * Math.sqrt(i) * Math.cos(i * 2.4),
+  y: 30 * Math.sqrt(i) * Math.sin(i * 2.4),
   _community: n.community, _community_name: n.community_name,
   _source_file: n.source_file, _file_type: n.file_type, _degree: n.degree,
 }})));
@@ -399,7 +407,7 @@ def to_html(
     member_counts: dict[int, int] | None = None,
     node_limit: int | None = None,
     learning_overlay: dict | None = None,
-) -> None:
+) -> bool:
     """Generate an interactive vis.js HTML visualization of the graph.
 
     Features: node size by degree, click-to-inspect panel, search box,
@@ -411,6 +419,9 @@ def to_html(
 
     If node_limit is set and the graph exceeds it, automatically builds an
     aggregated community-level meta-graph instead of raising ValueError.
+
+    Returns True when the output was written. Returns False when an aggregated
+    view would contain fewer than two communities and is intentionally skipped.
     """
     limit = node_limit if node_limit is not None else _viz_node_limit()
     if G.number_of_nodes() > limit:
@@ -433,7 +444,7 @@ def to_html(
                               relation=f"{w} cross-community edges", confidence="AGGREGATED")
             if meta.number_of_nodes() <= 1:
                 print("Single community - aggregated view not useful. Skipping graph.html.")
-                return
+                return False
             meta_communities = {cid: [str(cid)] for cid in communities}
             mc = {cid: len(members) for cid, members in communities.items()}
             # Remap hyperedges from semantic node IDs to community IDs
@@ -460,11 +471,13 @@ def to_html(
                         "nodes": comm_ids,
                     })
                 meta.graph["hyperedges"] = remapped
-            to_html(meta, meta_communities, output_path,
-                    community_labels=community_labels, member_counts=mc)
+            written = to_html(meta, meta_communities, output_path,
+                              community_labels=community_labels, member_counts=mc)
+            if not written:
+                return False
             print(f"graph.html written (aggregated: {meta.number_of_nodes()} community nodes, {meta.number_of_edges()} cross-community edges)")
             print("Tip: run with --obsidian for full node-level detail.")
-            return
+            return True
         raise ValueError(
             f"Graph has {G.number_of_nodes()} nodes - too large for HTML viz "
             f"(limit: {limit}). Use --no-viz, raise GRAPHIFY_VIZ_NODE_LIMIT, "
@@ -512,7 +525,16 @@ def to_html(
             "color": {"background": color, "border": color, "highlight": {"background": "#ffffff", "border": color}},
             "size": round(size, 1),
             "font": {"size": font_size, "color": "#ffffff"},
-            "title": _html.escape(label),
+            # Tooltip `title` is a STRING, which vis-network renders via
+            # Popup.setText -> `frame.innerText = t` (verified in the pinned
+            # 9.1.6 bundle: the only non-Element branch is innerText, and the
+            # bundle has zero `innerHTML = <var>` sinks). So raw special chars
+            # are shown literally and must NOT be html-escaped here or the user
+            # sees `&amp;`/`&lt;` in the tooltip (#3664/#3686). This is the
+            # #1838 stored-XSS boundary: never pass an HTMLElement as `title`,
+            # and do not change the vis-network pin below without re-checking
+            # Popup rendering (the test_export version-pin guard enforces this).
+            "title": label,
             "community": cid,
             "community_name": sanitize_label((community_labels or {}).get(cid, f"Community {cid}")),
             "source_file": sanitize_label(str(data.get("source_file") or "")),
@@ -548,7 +570,7 @@ def to_html(
                 lesson = f"Lesson: {status} ({entry.get('uses', 0)} useful)"
             if stale:
                 lesson += " [code changed — re-verify]"
-            node["title"] = _html.escape(label) + "\n" + _html.escape(sanitize_label(lesson))
+            node["title"] = f"{label}\n{sanitize_label(lesson)}"
         vis_nodes.append(node)
 
     # Build edges list. Restore original edge direction from _src/_tgt
@@ -565,7 +587,7 @@ def to_html(
             "from": true_src,
             "to": true_tgt,
             "label": relation,
-            "title": _html.escape(f"{relation} [{confidence}]"),
+            "title": sanitize_label(f"{relation} [{confidence}]"),
             "dashes": confidence != "EXTRACTED",
             "width": 2 if confidence == "EXTRACTED" else 1,
             "color": {"opacity": 0.7 if confidence == "EXTRACTED" else 0.35},
@@ -626,4 +648,5 @@ def to_html(
 </body>
 </html>"""
 
-    Path(output_path).write_text(html, encoding="utf-8")  # nosec
+    write_text_atomic(output_path, html)
+    return True
