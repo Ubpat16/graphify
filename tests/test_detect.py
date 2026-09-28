@@ -171,7 +171,7 @@ def test_graphifyignore_matches_nfd_path_with_nfc_pattern(tmp_path):
     nfd_name = unicodedata.normalize("NFD", nfc_name)
     assert nfc_name != nfd_name  # guard: the two forms really do differ
 
-    (tmp_path / ".graphifyignore").write_text(f"{nfc_name}/\n")
+    (tmp_path / ".graphifyignore").write_text(f"{nfc_name}/\n", encoding="utf-8")
     secret_dir = tmp_path / nfd_name
     secret_dir.mkdir()
     (secret_dir / "contrato.py").write_text("x = 1")
@@ -188,7 +188,7 @@ def test_graphifyignore_matches_nfc_path_with_nfd_pattern(tmp_path):
     nfc_name = unicodedata.normalize("NFC", "Or\u00e7amento")
     nfd_name = unicodedata.normalize("NFD", nfc_name)
 
-    (tmp_path / ".graphifyignore").write_text(f"{nfd_name}/\n")
+    (tmp_path / ".graphifyignore").write_text(f"{nfd_name}/\n", encoding="utf-8")
     d = tmp_path / nfc_name
     d.mkdir()
     (d / "contrato.py").write_text("x = 1")
@@ -872,6 +872,58 @@ def test_detect_converts_google_workspace_shortcuts_when_enabled(tmp_path, monke
     assert result["total_words"] > 0
 
 
+def test_detect_office_sidecar_survives_a_gitignored_output_dir(tmp_path, monkeypatch):
+    """#3504: the documented .gitignore advice puts graphify-out/ (and so
+    graphify-out/converted/, where Office sidecars land) inside a gitignored
+    tree. The ignore check exists to keep USER files out of the scan, not to
+    filter output this same pass just produced from an already-admitted
+    source file -- so a sidecar landing under converted/ must survive it,
+    or every .docx/.xlsx silently vanishes from the corpus the moment a repo
+    follows that advice."""
+    (tmp_path / ".gitignore").write_text("graphify-out/\n", encoding="utf-8")
+    src = tmp_path / "report.docx"
+    src.write_text("placeholder", encoding="utf-8")
+
+    def fake_convert(path, out_dir, root=None):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / "report_converted.md"
+        out.write_text("# Report\n\nConverted content.", encoding="utf-8")
+        return out
+
+    monkeypatch.setattr("graphify.detect.convert_office_file", fake_convert)
+
+    result = detect(tmp_path)
+
+    assert len(result["files"]["document"]) == 1, (
+        "the Office sidecar was dropped by the gitignore check on the tool's own output dir"
+    )
+    assert result["files"]["document"][0].endswith("report_converted.md")
+    assert result["total_words"] > 0
+
+
+def test_detect_google_workspace_sidecar_survives_a_gitignored_output_dir(tmp_path, monkeypatch):
+    """Same trap as the Office sidecar case (#3504), for the Google Workspace
+    conversion branch, which writes into the same converted/ directory."""
+    (tmp_path / ".gitignore").write_text("graphify-out/\n", encoding="utf-8")
+    shortcut = tmp_path / "notes.gdoc"
+    shortcut.write_text('{"doc_id":"doc-1"}', encoding="utf-8")
+
+    def fake_convert(path, out_dir, *, xlsx_to_markdown=None, root=None):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / "notes_converted.md"
+        out.write_text("# Notes\n\nA converted Google Doc.", encoding="utf-8")
+        return out
+
+    monkeypatch.setattr("graphify.detect.convert_google_workspace_file", fake_convert)
+
+    result = detect(tmp_path, google_workspace=True)
+
+    assert len(result["files"]["document"]) == 1, (
+        "the Google Workspace sidecar was dropped by the gitignore check on the tool's own output dir"
+    )
+    assert result["files"]["document"][0].endswith("notes_converted.md")
+
+
 def test_detect_includes_video_key(tmp_path):
     """detect() result always includes a 'video' key even with no video files."""
     (tmp_path / "main.py").write_text("x = 1")
@@ -1521,6 +1573,194 @@ def test_is_ignored_cache_evaluates_each_dir_once():
     # All five distinct files are computed once each.
     for f in files:
         assert eval_counts[f] == 1
+
+
+# Regression tests for the per-file pathlib ignore-evaluation defect: a scan of
+# a 76k-file vault with a 29k-file directory listed in .graphifyignore pinned a
+# CPU for 50+ minutes inside _eval's per-pattern Path.relative_to calls. The
+# walk must pay ONE evaluation per ignored directory (pruning), and each
+# evaluated entry must pay string matching, not per-pattern Path construction.
+
+def test_ignored_dir_pruned_walk_never_lists_contents(tmp_path, monkeypatch):
+    """A dir matching an ignore pattern is pruned from os.walk in one evaluation.
+
+    The walk must never descend into it (its files are never listed), while
+    non-ignored siblings are still detected. Mirrors the real defect shape:
+    a regenerated notes/ dir listed in .graphifyignore.
+    """
+    import graphify.detect as det
+
+    (tmp_path / ".graphifyignore").write_text("graphify-notes/\n")
+    for d in range(5):
+        sub = tmp_path / "graphify-notes" / f"note-dir-{d}"
+        sub.mkdir(parents=True)
+        for f in range(4):
+            (sub / f"note-{f}.md").write_text("# note")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("y = 2")
+    (tmp_path / "notes.md").write_text("# kept")
+
+    visited: list[str] = []
+    real_walk = os.walk
+
+    def tracking_walk(top, *args, **kwargs):
+        for dirpath, dirnames, filenames in real_walk(top, *args, **kwargs):
+            visited.append(dirpath)
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(det.os, "walk", tracking_walk)
+    result = det.detect(tmp_path)
+
+    assert not any("graphify-notes" in Path(v).parts for v in visited), (
+        "walk descended into the ignored dir — directory pruning regressed"
+    )
+    all_files = as_posix_list(p for cat in result["files"].values() for p in cat)
+    assert not any("graphify-notes" in p for p in all_files)
+    assert any(p.endswith("src/app.py") for p in all_files)
+    assert any(p.endswith("notes.md") for p in all_files)
+    # The pruned dir is reported once, as a directory entry.
+    ignored = as_posix_list(result["ignored"])
+    assert sum("graphify-notes" in p for p in ignored) == 1
+
+
+def test_scan_ignore_cost_is_per_directory_not_per_file(tmp_path, monkeypatch):
+    """On a 2,000-file tree under an ignored dir, ignore evaluation is O(dirs).
+
+    Counts _is_scan_ignored and _is_ignored invocations during detect(): the
+    ignored subtree must cost exactly one directory-level check — never one
+    per contained file (the 29k-file defect shape).
+    """
+    import graphify.detect as det
+
+    n_ignored_dirs, n_ignored_files_per_dir = 100, 20  # 2,000 ignored files
+    (tmp_path / ".graphifyignore").write_text("graphify-notes/\n")
+    for d in range(n_ignored_dirs):
+        sub = tmp_path / "graphify-notes" / f"note-dir-{d:03d}"
+        sub.mkdir(parents=True)
+        for f in range(n_ignored_files_per_dir):
+            (sub / f"note-{f:02d}.md").write_text("# note")
+    kept = 0
+    for d in range(5):
+        sub = tmp_path / "src" / f"pkg{d}"
+        sub.mkdir(parents=True)
+        for f in range(10):
+            (sub / f"mod{f}.py").write_text("x = 1")
+            kept += 1
+
+    scan_calls = {"total": 0, "under_ignored": 0}
+    real_scan = det._is_scan_ignored
+
+    def counting_scan(path, *args, **kwargs):
+        scan_calls["total"] += 1
+        if "graphify-notes" in path.parts:
+            scan_calls["under_ignored"] += 1
+        return real_scan(path, *args, **kwargs)
+
+    ignored_calls = {"total": 0}
+    real_is_ignored = det._is_ignored
+
+    def counting_is_ignored(*args, **kwargs):
+        ignored_calls["total"] += 1
+        return real_is_ignored(*args, **kwargs)
+
+    monkeypatch.setattr(det, "_is_scan_ignored", counting_scan)
+    monkeypatch.setattr(det, "_is_ignored", counting_is_ignored)
+    result = det.detect(tmp_path)
+
+    assert result["total_files"] == kept
+    # Exactly ONE ignore evaluation for the whole ignored subtree.
+    assert scan_calls["under_ignored"] == 1, (
+        f"{scan_calls['under_ignored']} evaluations under the ignored dir — "
+        "expected 1 (the directory itself); per-file evaluation regressed"
+    )
+    # Overall evaluation count scales with kept entries + dirs, not with the
+    # 2,000 files inside the ignored dir.
+    budget = 4 * (kept + n_ignored_dirs)
+    assert scan_calls["total"] < budget, (
+        f"{scan_calls['total']} _is_scan_ignored calls, expected < {budget}"
+    )
+    assert ignored_calls["total"] < 2 * budget, (
+        f"{ignored_calls['total']} _is_ignored calls, expected < {2 * budget}"
+    )
+
+
+def test_is_ignored_no_per_pattern_path_construction(monkeypatch):
+    """_eval must not build pathlib objects per pattern.
+
+    The old shape called target.relative_to(anchor) for EVERY pattern for
+    every entry (pathlib construction dominated a 52-minute scan, caught by
+    py-spy at detect.py's _eval). With N patterns, one _is_ignored call must
+    make O(1) relative_to calls — not O(N).
+    """
+    import pathlib
+
+    from graphify.detect import _is_ignored
+
+    root = Path("/repo")
+    patterns = [(root, f"*.zzz{i}") for i in range(200)]
+    patterns.append((root, "never-matches-dir/"))
+    target = root / "a" / "b" / "c" / "leaf.py"
+
+    counts = {"relative_to": 0}
+    real_relative_to = pathlib.PurePath.relative_to
+
+    def counting_relative_to(self, *args, **kwargs):
+        counts["relative_to"] += 1
+        return real_relative_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.PurePath, "relative_to", counting_relative_to)
+    assert not _is_ignored(target, root, patterns)
+
+    # One rel_parts computation for the ancestor walk; _eval itself must add
+    # none. Old code: ~200+ (one per pattern, per evaluated ancestor + leaf).
+    assert counts["relative_to"] <= 6, (
+        f"{counts['relative_to']} relative_to calls for 201 patterns — "
+        "per-pattern pathlib construction is back"
+    )
+
+
+def test_string_matcher_preserves_pattern_forms(tmp_path):
+    """Each supported pattern form matches/misses exactly as before the
+    string-space rewrite of _eval (rel computed once per entry, patterns
+    matched with fnmatch/segment logic on strings)."""
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "x.py").write_text("x=1")
+    (tmp_path / "notbuild").mkdir()
+    (tmp_path / "notbuild" / "build").write_text("plain file named build")
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "drop.log").write_text("x")
+    (tmp_path / "logs" / "keep.log").write_text("x")
+    (tmp_path / "anchored.md").write_text("x")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "anchored.md").write_text("x")
+    (tmp_path / "docs" / "deep").mkdir(parents=True)
+    (tmp_path / "docs" / "deep" / "guide.md").write_text("x")
+    (tmp_path / "x" / "cache" / "y").mkdir(parents=True)
+    (tmp_path / "x" / "cache" / "y" / "f.py").write_text("x=1")
+    (tmp_path / ".graphifyignore").write_text(
+        "build/\n*.log\n!keep.log\n/anchored.md\ndocs/**\ncache\n"
+    )
+    patterns = _load_graphifyignore(tmp_path)
+
+    # dir-only pattern: matches the dir and everything under it...
+    assert _is_ignored(tmp_path / "build", tmp_path, patterns)
+    assert _is_ignored(tmp_path / "build" / "x.py", tmp_path, patterns)
+    # ...but never a plain FILE of the same name
+    assert not _is_ignored(tmp_path / "notbuild" / "build", tmp_path, patterns)
+    # glob + basename negation, last match wins
+    assert _is_ignored(tmp_path / "logs" / "drop.log", tmp_path, patterns)
+    assert not _is_ignored(tmp_path / "logs" / "keep.log", tmp_path, patterns)
+    # anchored file pattern: root level only
+    assert _is_ignored(tmp_path / "anchored.md", tmp_path, patterns)
+    assert not _is_ignored(tmp_path / "sub" / "anchored.md", tmp_path, patterns)
+    # ** crosses path segments under its anchor
+    assert _is_ignored(tmp_path / "docs" / "deep" / "guide.md", tmp_path, patterns)
+    # bare segment pattern matches an intermediate directory anywhere
+    assert _is_ignored(tmp_path / "x" / "cache", tmp_path, patterns)
+    assert _is_ignored(tmp_path / "x" / "cache" / "y" / "f.py", tmp_path, patterns)
+    # unrelated paths untouched
+    assert not _is_ignored(tmp_path / "notbuild", tmp_path, patterns)
+    assert not _is_ignored(tmp_path / "sub", tmp_path, patterns)
 
 
 # Regression tests for #920 - sensitive pattern misses underscore-prefixed names
@@ -2276,6 +2516,137 @@ def test_load_manifest_passes_through_legacy_absolute_keys(tmp_path):
     assert abs_key in loaded
 
 
+def test_load_manifest_prefers_the_more_recently_seen_duplicate(tmp_path):
+    """#1964: a manifest written across a mix of call sites — some passing
+    root (relative keys), some not (an outdated installed skill runbook,
+    for one) — can end up with both an absolute and a relative key for the
+    same file, each carrying different data. load_manifest must keep
+    whichever was more recently seen, not whichever raw key happens to
+    iterate last in the on-disk JSON."""
+    import json
+    from graphify.detect import load_manifest
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.py").write_text("def x(): pass\n")
+    abs_key = str((tmp_path / "src" / "foo.py").resolve())
+
+    manifest_path = tmp_path / "graphify-out" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+
+    # Stale entry (absolute key) written first, fresh entry (relative key)
+    # written second -- the fresh one iterates last and should win either way.
+    manifest_path.write_text(json.dumps({
+        abs_key: {"mtime": 1.0, "seen": 1.0, "ast_hash": "stale", "semantic_hash": ""},
+        "src/foo.py": {"mtime": 2.0, "seen": 2.0, "ast_hash": "fresh", "semantic_hash": "fresh_sem"},
+    }))
+    loaded = load_manifest(str(manifest_path), root=tmp_path)
+    assert loaded[abs_key]["ast_hash"] == "fresh"
+
+    # Same two entries, opposite on-disk order: the stale one now iterates
+    # last, so a plain "keep whichever is seen last" collapse would wrongly
+    # keep it. The seen timestamp must still pick the fresh one.
+    manifest_path.write_text(json.dumps({
+        "src/foo.py": {"mtime": 2.0, "seen": 2.0, "ast_hash": "fresh", "semantic_hash": "fresh_sem"},
+        abs_key: {"mtime": 1.0, "seen": 1.0, "ast_hash": "stale", "semantic_hash": ""},
+    }))
+    loaded = load_manifest(str(manifest_path), root=tmp_path)
+    assert loaded[abs_key]["ast_hash"] == "fresh", (
+        "the entry with the later seen timestamp must win regardless of "
+        "on-disk key order"
+    )
+    assert loaded[abs_key]["semantic_hash"] == "fresh_sem"
+
+
+def test_load_manifest_collapses_a_relative_key_with_a_dot_dot_segment(tmp_path):
+    """Review finding on #1964: _to_absolute_from_storage joined a relative
+    key onto the resolved root with a plain Path '/' , which never collapses
+    a '..' segment the way .resolve() does. A relative key like
+    'sub/../foo.py' (the kind of format mismatch this function exists to
+    tolerate, per its own docstring on mixed call sites/versions) then
+    canonicalized to a different string than the plain absolute key for the
+    same file, so the two entries never collapsed at all."""
+    import json
+    from graphify.detect import load_manifest
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.py").write_text("def x(): pass\n")
+    abs_key = str((tmp_path / "src" / "foo.py").resolve())
+
+    manifest_path = tmp_path / "graphify-out" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps({
+        abs_key: {"mtime": 1.0, "seen": 1.0, "ast_hash": "stale", "semantic_hash": ""},
+        "src/../src/foo.py": {"mtime": 2.0, "seen": 2.0, "ast_hash": "fresh", "semantic_hash": "fresh_sem"},
+    }))
+    loaded = load_manifest(str(manifest_path), root=tmp_path)
+    assert len(loaded) == 1, (
+        f"the dotted-segment key must canonicalize onto the same absolute "
+        f"path and collapse with the plain one, got {list(loaded)!r}"
+    )
+    assert loaded[abs_key]["ast_hash"] == "fresh"
+
+
+def test_to_absolute_from_storage_recognizes_a_foreign_platform_absolute_key(tmp_path):
+    """Review finding on #1964: Path.is_absolute() only recognizes the
+    CURRENT platform's own syntax, so a manifest genuinely moved between
+    platforms (this module's own stated scope) could carry a key like
+    'C:/Users/x/foo.py' or '\\\\server\\share\\foo.py' loaded on POSIX, or
+    '/abs/path' loaded on Windows. Pre-fix, such a key was wrongly judged
+    relative and joined onto root, producing a nonsense path like
+    '<root>/C:/Users/x/foo.py' instead of being left alone."""
+    from graphify.detect import _looks_absolute, _to_absolute_from_storage
+
+    for foreign_key in (
+        "C:/Users/x/foo.py",
+        "C:\\Users\\x\\foo.py",
+        "\\\\server\\share\\foo.py",
+        "/abs/path/foo.py",
+    ):
+        assert _looks_absolute(foreign_key), foreign_key
+
+    result = _to_absolute_from_storage("C:/Users/x/foo.py", tmp_path)
+    assert str(tmp_path) not in result, (
+        f"a foreign-platform absolute key must not be joined onto root, got {result!r}"
+    )
+    assert _looks_absolute("src/foo.py") is False
+
+
+def test_save_manifest_relativize_step_collapses_seeded_duplicates(tmp_path):
+    """#1964: the same collapse must happen on the WRITE side too. If the
+    existing on-disk manifest already has both an absolute and a relative
+    key for a file untouched by this save (seeded through unchanged, #917),
+    the relativize step must not silently keep the stale one just because
+    it happens to iterate last."""
+    import json
+    from graphify.detect import save_manifest
+
+    (tmp_path / "src").mkdir()
+    tracked = tmp_path / "src" / "foo.py"
+    tracked.write_text("def x(): pass\n")
+    other = tmp_path / "bar.py"
+    other.write_text("def y(): pass\n")
+    abs_key = str(tracked.resolve())
+
+    manifest_path = tmp_path / "graphify-out" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    # Fresh (relative) entry iterates first, stale (absolute) entry last --
+    # save_manifest's own seed step must still prefer the fresher one.
+    manifest_path.write_text(json.dumps({
+        "src/foo.py": {"mtime": 2.0, "seen": 2.0, "ast_hash": "fresh", "semantic_hash": "fresh_sem"},
+        abs_key: {"mtime": 1.0, "seen": 1.0, "ast_hash": "stale", "semantic_hash": ""},
+    }))
+
+    # Save touching only a DIFFERENT file, so foo.py's row is only seeded
+    # through, never freshly stamped -- isolates the relativize collapse.
+    save_manifest({"code": [str(other)]}, str(manifest_path), root=tmp_path)
+
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert raw["src/foo.py"]["ast_hash"] == "fresh", (
+        "the seed step must keep the more recently seen duplicate when "
+        "collapsing keys, not whichever iterates last"
+    )
+
+
 def test_save_manifest_out_of_root_keeps_absolute(tmp_path):
     """Files outside ``root`` (e.g. symlinked external corpora) are stored
     absolute so they round-trip on the saving machine even when they can't
@@ -2555,6 +2926,84 @@ def test_convert_office_file_outside_root_falls_back(tmp_path, monkeypatch):
     out1 = detect_mod.convert_office_file(outside, out_dir, root=root)
     out2 = detect_mod.convert_office_file(outside, out_dir, root=root)
     assert out1 is not None and out1.name == out2.name
+
+
+def test_detect_office_conversion_respects_cache_root(tmp_path, monkeypatch):
+    """#2787: detect() with cache_root must write converted sidecars under
+    cache_root/GRAPHIFY_OUT/converted, leaving the scanned corpus untouched, while
+    keeping the sidecar filename hash anchored to the scan root."""
+    monkeypatch.setattr(detect_mod, "docx_to_markdown", lambda p: "# Spec\nConverted specification text.")
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir(parents=True)
+    cache_out = tmp_path / "cache_out"
+    cache_out.mkdir(parents=True)
+
+    doc_path = corpus / "spec.docx"
+    doc_path.write_bytes(b"placeholder")
+
+    result = detect(corpus, cache_root=cache_out)
+
+    # 1. Scanned corpus tree must not be mutated
+    assert not (corpus / detect_mod.GRAPHIFY_OUT).exists(), (
+        "detect() must not write graphify-out into the scanned corpus tree when cache_root is provided (#2787)"
+    )
+
+    # 2. Converted sidecar must exist under cache_root
+    converted_dir = cache_out / detect_mod.GRAPHIFY_OUT / "converted"
+    assert converted_dir.is_dir(), "converted directory must be created under cache_root"
+
+    # 3. Detection result must point to the redirected sidecar
+    doc_files = result["files"]["document"]
+    assert len(doc_files) == 1
+    sidecar_path = Path(doc_files[0])
+    assert sidecar_path.is_file()
+    assert sidecar_path.parent.resolve() == converted_dir.resolve()
+
+    # 4. Content must match expected conversion
+    content = sidecar_path.read_text(encoding="utf-8")
+    assert "<!-- converted from spec.docx -->" in content
+    assert "# Spec" in content
+
+    # 5. Sidecar filename must remain anchored to the corpus scan root
+    import hashlib
+    expected_hash = hashlib.sha256(unicodedata.normalize("NFC", "spec.docx").encode()).hexdigest()[:8]
+    assert sidecar_path.name == f"spec_{expected_hash}.md"
+
+
+def test_detect_incremental_respects_cache_root(tmp_path, monkeypatch):
+    """#3847: detect_incremental had no cache_root parameter at all, unlike
+    detect(), so an incremental extract run with a --out destination outside
+    the scan root fell back to anchoring the word-count stat index at the
+    scan root itself — leaking graphify-out/cache/stat-index.json into the
+    corpus even though a fresh (non-incremental) run to the same destination
+    stays clean."""
+    from graphify import cache as cache_mod
+
+    monkeypatch.setattr(cache_mod, "_stat_index", {})
+    monkeypatch.setattr(cache_mod, "_stat_index_root", None)
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    cache_out = tmp_path / "cache_out"
+    cache_out.mkdir()
+
+    doc = corpus / "notes.md"
+    doc.write_text("Some notes content here.")
+
+    manifest_path = str(cache_out / "manifest.json")
+    save_manifest({}, manifest_path, root=corpus)
+
+    detect_incremental(corpus, manifest_path=manifest_path, cache_root=cache_out)
+    cache_mod._flush_stat_index()
+
+    assert not (corpus / detect_mod.GRAPHIFY_OUT).exists(), (
+        "detect_incremental() must not write graphify-out into the scanned "
+        "corpus tree when cache_root is provided (#3847)"
+    )
+    assert (cache_out / detect_mod.GRAPHIFY_OUT / "cache" / "stat-index.json").is_file(), (
+        "the word-count stat index must land under cache_root instead"
+    )
 
 
 def test_detect_keeps_env_source_dirs(tmp_path):
@@ -2989,6 +3438,106 @@ def test_detect_incremental_exclusion_stable_across_runs(tmp_path):
     assert inc2["excluded_files"] == []
 
 
+# ── #2838: manifest seen timestamps preserved for unchanged entries ──
+
+def test_save_manifest_unchanged_file_preserves_seen(tmp_path):
+    """#2838: save_manifest preserves existing seen timestamp for unchanged entries."""
+    import json
+    a = tmp_path / "a.py"
+    a.write_text("x = 1\n", encoding="utf-8")
+    manifest_path = str(tmp_path / "graphify-out" / "manifest.json")
+
+    save_manifest({"code": [str(a)]}, manifest_path, root=tmp_path)
+    raw1 = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    seen_1 = raw1["a.py"]["seen"]
+    assert isinstance(seen_1, (int, float))
+
+    # Second save on unchanged file must keep identical seen value
+    save_manifest({"code": [str(a)]}, manifest_path, root=tmp_path)
+    raw2 = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    assert raw2["a.py"]["seen"] == seen_1
+    assert raw2["a.py"]["ast_hash"] == raw1["a.py"]["ast_hash"]
+    assert raw2["a.py"]["mtime"] == raw1["a.py"]["mtime"]
+
+
+def test_save_manifest_changed_file_updates_seen(tmp_path):
+    """#2838: save_manifest assigns a new seen timestamp when file content changes."""
+    import json
+    import time
+    a = tmp_path / "a.py"
+    a.write_text("x = 1\n", encoding="utf-8")
+    manifest_path = str(tmp_path / "graphify-out" / "manifest.json")
+
+    save_manifest({"code": [str(a)]}, manifest_path, root=tmp_path)
+    raw1 = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    seen_1 = raw1["a.py"]["seen"]
+
+    # Modify file content (new hash)
+    time.sleep(0.01)
+    a.write_text("x = 2\n", encoding="utf-8")
+    save_manifest({"code": [str(a)]}, manifest_path, root=tmp_path)
+    raw2 = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+
+    assert raw2["a.py"]["seen"] >= seen_1
+    assert raw2["a.py"]["ast_hash"] != raw1["a.py"]["ast_hash"]
+
+
+def test_save_manifest_noop_skips_disk_write(tmp_path):
+    """#2838: save_manifest does not rewrite manifest.json when payload is identical."""
+    a = tmp_path / "a.py"
+    a.write_text("x = 1\n", encoding="utf-8")
+    manifest_path = Path(tmp_path / "graphify-out" / "manifest.json")
+
+    save_manifest({"code": [str(a)]}, str(manifest_path), root=tmp_path)
+    mtime_1 = manifest_path.stat().st_mtime_ns
+    bytes_1 = manifest_path.read_bytes()
+
+    save_manifest({"code": [str(a)]}, str(manifest_path), root=tmp_path)
+    mtime_2 = manifest_path.stat().st_mtime_ns
+    bytes_2 = manifest_path.read_bytes()
+
+    assert bytes_1 == bytes_2
+    assert mtime_1 == mtime_2
+
+
+def test_save_manifest_ast_kind_noop_then_change(tmp_path):
+    """#2838's literal path: `graphify update` calls save_manifest with kind='ast'.
+    A no-op re-run must leave the manifest byte-identical; a real edit must update it."""
+    import json
+    a = tmp_path / "a.py"
+    a.write_text("x = 1\n", encoding="utf-8")
+    manifest_path = Path(tmp_path / "graphify-out" / "manifest.json")
+
+    save_manifest({"code": [str(a)]}, str(manifest_path), root=tmp_path, kind="ast")
+    bytes_1 = manifest_path.read_bytes()
+    seen_1 = json.loads(bytes_1)["a.py"]["seen"]
+
+    save_manifest({"code": [str(a)]}, str(manifest_path), root=tmp_path, kind="ast")  # no-op
+    assert manifest_path.read_bytes() == bytes_1, "ast-kind no-op re-run churned the manifest"
+
+    import time as _t; _t.sleep(0.01)
+    a.write_text("x = 2\n", encoding="utf-8")
+    save_manifest({"code": [str(a)]}, str(manifest_path), root=tmp_path, kind="ast")
+    raw2 = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert raw2["a.py"]["ast_hash"] != json.loads(bytes_1)["a.py"]["ast_hash"]
+    assert raw2["a.py"]["seen"] >= seen_1
+
+
+def test_save_manifest_corrupt_existing_manifest_still_writes(tmp_path):
+    """The byte-equality skip must never turn an unparseable on-disk manifest into
+    a silent no-write — a real update has to persist over corruption."""
+    import json
+    a = tmp_path / "a.py"
+    a.write_text("x = 1\n", encoding="utf-8")
+    manifest_path = Path(tmp_path / "graphify-out" / "manifest.json")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text("{ this is not valid json", encoding="utf-8")
+
+    save_manifest({"code": [str(a)]}, str(manifest_path), root=tmp_path)
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))  # must parse now
+    assert "a.py" in raw and isinstance(raw["a.py"]["seen"], (int, float))
+
+
 # ── #2106: sensitive-filter over-match (prose/source rescued, real secrets kept) ──
 
 @pytest.mark.parametrize("path", [
@@ -3029,6 +3578,40 @@ def test_sensitive_bare_keyword_prose_still_dropped():
     assert not _is_sensitive(Path("token-lifecycle.md"))  # multi-word slug indexed
 
 
+@pytest.mark.parametrize("path", [
+    "TOKENS.md",
+    "tokens.md",
+    "tokens.rst",
+])
+def test_sensitive_bare_plural_tokens_prose_indexed(path):
+    """Bare plural "tokens" in a prose file is a design-token reference doc,
+    not a credential dump — unlike "token.md" (singular) or "secrets.md"
+    (another keyword's bare plural), which still read as dumps (#3527)."""
+    from graphify.detect import _is_sensitive
+    assert not _is_sensitive(Path(path))
+
+
+def test_sensitive_bare_plural_tokens_still_flagged_outside_prose():
+    """The plural exemption is scoped to prose extensions only — "tokens.txt"
+    is still a plausible secret store and stays excluded (#3527)."""
+    from graphify.detect import _is_sensitive
+    assert _is_sensitive(Path("tokens.txt"))
+    assert _is_sensitive(Path("tokens.json"))
+
+
+@pytest.mark.parametrize("path", [
+    "app/lib/theme/shell_tokens.dart",
+    "src/design/tokens.ts",
+    "src/hard-tokens.ts",
+])
+def test_sensitive_design_token_source_files_indexed(path):
+    """Genuine design-token source files (.dart/.ts) are graphable source and
+    exempt from the generic-keyword drop regardless of the bare/plural rules
+    above — they were the headline repro in #3527."""
+    from graphify.detect import _is_sensitive
+    assert not _is_sensitive(Path(path))
+
+
 # ── #2232 / #2184: committed dotenv templates (.env.example etc.) are graphable ──
 
 @pytest.mark.parametrize("path", [
@@ -3066,3 +3649,47 @@ def test_sensitive_env_template_inside_secrets_dir_still_dropped(path):
     """Stage 1 dir guard runs before the Stage 2 template exemption: anything
     under a secrets/credentials dir stays excluded, template suffix or not."""
     assert _is_sensitive(Path(path)), f"{path} is under a secrets dir, must stay excluded (#2184)"
+
+
+def test_lexical_relative_matches_pathlib_relative_to():
+    """The string-space `_lexical_relative` must return exactly what
+    `_nfc(str(target.relative_to(anchor)).replace(os.sep, "/"))` would — including
+    None where relative_to raises (target not under anchor). Guards the
+    reimplemented relative_to against silent drift (#2226)."""
+    from pathlib import Path
+    from graphify.detect import _lexical_relative, _nfc
+
+    anchors = ["/a/b", "/a", "/a/b/c", "/x", "/"]
+    targets = [
+        "/a/b/c/d.py", "/a/b", "/a/b/c", "/a/x.py", "/a/b/c/d/e.py",
+        "/x/y.py", "/other/z.py", "/a/bb/c.py", "/a/b/c",
+    ]
+    for r in anchors:
+        anchor = Path(r)
+        for t in targets:
+            target = Path(t)
+            try:
+                expected = _nfc(str(target.relative_to(anchor)).replace(os.sep, "/"))
+            except ValueError:
+                expected = None
+            assert _lexical_relative(target, target.parts, anchor) == expected, (t, r)
+
+
+def test_globstar_matcher_leaves_no_reference_cycle():
+    """`_match_anchored_ignore_pattern` must not leak a reference cycle per call,
+    as the old per-call `@lru_cache` closure did (it referenced itself). With gc
+    disabled, a run of the matcher must leave nothing for the collector."""
+    import gc
+    from graphify.detect import _match_anchored_ignore_pattern
+
+    gc.collect()
+    gc.disable()
+    try:
+        for _ in range(500):
+            assert _match_anchored_ignore_pattern("docs/deep/guide.md", "docs/**")
+            assert not _match_anchored_ignore_pattern("src/app.py", "docs/**")
+            assert _match_anchored_ignore_pattern("a/b/c.py", "a/*/c.py")
+        collected = gc.collect()
+    finally:
+        gc.enable()
+    assert collected == 0, f"globstar matcher leaked {collected} cyclic objects per run"

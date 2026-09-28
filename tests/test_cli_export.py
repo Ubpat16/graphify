@@ -70,6 +70,34 @@ def test_export_html_creates_file(tmp_path):
     assert html.stat().st_size > 0
 
 
+def test_export_html_prefers_top_level_hyperedges(tmp_path):
+    out = _make_graph(tmp_path)
+    graph_path = out / "graph.json"
+    data = json.loads(graph_path.read_text())
+    data["hyperedges"] = [
+        {
+            "id": "top-level",
+            "label": "top-level edit",
+            "nodes": ["n_transformer", "n_attention", "n_layernorm"],
+        }
+    ]
+    data["graph"]["hyperedges"] = [
+        {
+            "id": "nested",
+            "label": "stale nested copy",
+            "nodes": ["n_attention", "n_layernorm", "n_concept_attn"],
+        }
+    ]
+    graph_path.write_text(json.dumps(data))
+
+    r = _run(["export", "html"], tmp_path)
+
+    assert r.returncode == 0, r.stderr
+    html = (out / "graph.html").read_text()
+    assert "top-level edit" in html
+    assert "stale nested copy" not in html
+
+
 def test_export_html_no_viz_removes_file(tmp_path):
     out = _make_graph(tmp_path)
     (out / "graph.html").write_text("<html/>")
@@ -631,6 +659,80 @@ def test_export_html_no_community_data_at_all_still_succeeds(tmp_path):
     assert r.returncode == 0, r.stderr
 
 
+# ── #2386: sidecar exists but is STALE, not just absent ──────────────────────
+# update/watch advance graph.json's per-node community attribute but never
+# regenerate .graphify_analysis.json, so it can describe an earlier
+# clustering pass while still being present. That looked identical to a
+# fresh sidecar from the outside and kept winning over the correct data
+# sitting in graph.json.
+
+def test_export_html_prefers_fresh_data_when_sidecar_is_stale(tmp_path):
+    out = _make_graph(tmp_path)
+    analysis_path = out / ".graphify_analysis.json"
+    analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+    # Simulate staleness the way the issue describes: the sidecar's node id
+    # set no longer matches graph.json's (a node the sidecar never saw, or
+    # one it references that graph.json no longer has).
+    analysis["communities"] = {"0": ["a_ghost_node_id_not_in_the_graph"]}
+    analysis_path.write_text(json.dumps(analysis))
+
+    r = _run(["export", "html"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "is stale" in r.stderr
+    assert (out / "graph.html").exists()
+
+
+def test_export_wiki_recomputes_cohesion_when_sidecar_is_stale(tmp_path):
+    out = _make_graph(tmp_path)
+    analysis_path = out / ".graphify_analysis.json"
+    analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+    analysis["communities"] = {"0": ["a_ghost_node_id_not_in_the_graph"]}
+    # A cohesion value that could never be a real score (score_all returns
+    # values in a bounded range), so if it survives into the wiki output
+    # unchanged, the stale sidecar won instead of being recomputed.
+    analysis["cohesion"] = {"0": 999999.0}
+    analysis_path.write_text(json.dumps(analysis))
+
+    r = _run(["export", "wiki"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "is stale" in r.stderr
+    wiki_dir = out / "wiki"
+    assert wiki_dir.exists()
+    combined = "\n".join(p.read_text(encoding="utf-8") for p in wiki_dir.glob("*.md"))
+    assert "999999" not in combined, "stale cohesion value leaked into the wiki export"
+
+
+def test_export_html_uses_sidecar_when_it_still_matches(tmp_path):
+    """Negative control: an up to date sidecar must not trigger the stale
+    path or its warning."""
+    out = _make_graph(tmp_path)
+
+    r = _run(["export", "html"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "is stale" not in r.stderr
+    assert (out / "graph.html").exists()
+
+
+def test_export_html_detects_stale_sidecar_with_same_nodes_different_partition(tmp_path):
+    """A merge, a split, or a node moving from one community to another can
+    leave the overall node id set unchanged while still describing a
+    different partition -- comparing only the flat node-id set missed this
+    exact shape of staleness."""
+    out = _make_graph(tmp_path)
+    analysis_path = out / ".graphify_analysis.json"
+    analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+    communities = analysis["communities"]
+    assert len(communities) >= 2, "fixture must have at least two communities to prove this"
+    all_nodes = [n for nodes in communities.values() for n in nodes]
+    analysis["communities"] = {"0": all_nodes}
+    analysis_path.write_text(json.dumps(analysis))
+
+    r = _run(["export", "html"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "is stale" in r.stderr
+    assert (out / "graph.html").exists()
+
+
 def test_graph_json_node_ids_are_portable_across_checkout_paths(tmp_path):
     """#1789: the committed graph.json's node ids must be relative to the scan
     root — not embed the absolute path — so the same repo yields identical ids
@@ -775,3 +877,34 @@ def test_cluster_only_preserves_built_at_commit_from_non_repo_cwd(tmp_path):
     assert r.returncode == 0, r.stderr
     final = json.loads(graph_json.read_text(encoding="utf-8"))
     assert final.get("built_at_commit") == commit_x
+
+
+# ── graphify query names its graph (#2789) ───────────────────────────────────
+
+def test_query_command_header_names_the_graph(tmp_path):
+    """End-to-end: the CLI `query` command must actually wire the resolved graph
+    path into the header. The header logic is unit-tested in
+    test_query_names_its_graph.py, but only a real subprocess run proves the CLI
+    call site passes graph_path through (the wiring that was the point of #2789)."""
+    _make_graph(tmp_path)
+    r = _run(["query", "Transformer"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    first_line = r.stdout.splitlines()[0]
+    assert first_line.startswith("Graph: graphify-out/graph.json ("), first_line
+    assert "nodes)" in first_line
+    assert "Traversal:" in first_line
+
+
+def test_query_command_names_a_graph_outside_the_cwd(tmp_path):
+    """The #2789 scenario: querying an explicit graph that sits outside the CWD
+    must show it in full so the operator can tell the answer came from elsewhere."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    out = _make_graph(elsewhere)
+    here = tmp_path / "here"
+    here.mkdir()
+    r = _run(["query", "Transformer", "--graph", str(out / "graph.json")], here)
+    assert r.returncode == 0, r.stderr
+    first_line = r.stdout.splitlines()[0]
+    assert first_line.startswith("Graph: "), first_line
+    assert "elsewhere" in first_line, first_line

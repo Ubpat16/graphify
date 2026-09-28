@@ -73,6 +73,84 @@ def test_to_json_sorts_graph_collections_across_insertion_order(tmp_path):
     assert outputs[0].read_bytes() == outputs[1].read_bytes()
 
 
+def test_to_json_field_order_stable_across_read_rebuild(tmp_path):
+    """graph.json survives a build -> write -> read-back -> write round-trip
+    byte-for-byte. node_link_data always appends the node key (`id`) last, so a
+    node whose `id` was an inline attribute on a cold build lands mid-dict, while
+    the same node after build_from_json consumes `id` as the pure node key lands
+    last — identical values, churned field order. Emitting a canonical key order
+    keeps the two serializations identical. Regression guard: the earlier
+    determinism test only varied insertion order within one build and missed
+    this."""
+    extraction = {
+        "nodes": [
+            {"id": "a_foo", "label": "foo", "file_type": "code", "source_file": "a.py"},
+            {"id": "b_bar", "label": "bar", "file_type": "code", "source_file": "b.py"},
+            {"id": "c_baz", "label": "baz", "file_type": "code", "source_file": "c.py"},
+        ],
+        "edges": [
+            {"source": "a_foo", "target": "b_bar", "relation": "calls",
+             "confidence": "EXTRACTED", "confidence_score": 1.0, "source_file": "a.py"},
+            {"source": "b_bar", "target": "c_baz", "relation": "references",
+             "confidence": "EXTRACTED", "confidence_score": 1.0, "source_file": "b.py"},
+        ],
+        "hyperedges": [],
+    }
+    communities = {0: ["a_foo", "b_bar", "c_baz"]}
+
+    first = tmp_path / "first.json"
+    to_json(build_from_json(extraction), communities, str(first),
+            built_at_commit="fixed", force=True)
+    reread = json.loads(first.read_text())
+
+    second = tmp_path / "second.json"
+    to_json(build_from_json(reread), communities, str(second),
+            built_at_commit="fixed", force=True)
+
+    # Byte-identity is the strongest statement of "no cosmetic churn".
+    assert first.read_bytes() == second.read_bytes()
+
+    data = json.loads(first.read_text())
+    # `id` leads every node; source/target lead every link — the identity-first
+    # order node_link_data does not guarantee on its own.
+    for node in data["nodes"]:
+        assert list(node.keys())[0] == "id"
+    for link in data["links"]:
+        assert list(link.keys())[:2] == ["source", "target"]
+    # Endpoints are never swapped by the reordering.
+    endpoints = sorted((e["source"], e["target"]) for e in data["links"])
+    assert endpoints == [("a_foo", "b_bar"), ("b_bar", "c_baz")]
+
+
+def test_to_json_field_order_stable_with_non_ascii_labels(tmp_path):
+    """The byte-identity guarantee must hold with non-ASCII labels — the fix's
+    round-trip stability implicitly relies on the ensure_ascii write path, and a
+    reordered dict with escaped-unicode values must still serialize identically."""
+    extraction = {
+        "nodes": [
+            {"id": "a_cafe", "label": "café", "file_type": "code", "source_file": "a.py"},
+            {"id": "b_ja", "label": "日本語クラス", "file_type": "code", "source_file": "b.py"},
+        ],
+        "edges": [
+            {"source": "a_cafe", "target": "b_ja", "relation": "references",
+             "confidence": "INFERRED", "confidence_score": 0.55, "source_file": "a.py"},
+        ],
+        "hyperedges": [],
+    }
+    communities = {0: ["a_cafe", "b_ja"]}
+    first = tmp_path / "first.json"
+    to_json(build_from_json(extraction), communities, str(first),
+            built_at_commit="fixed", force=True)
+    reread = json.loads(first.read_text())
+    second = tmp_path / "second.json"
+    to_json(build_from_json(reread), communities, str(second),
+            built_at_commit="fixed", force=True)
+    assert first.read_bytes() == second.read_bytes(), "non-ASCII round-trip churned field order"
+    # the reorder preserves the non-ASCII value
+    labels = {n["id"]: n.get("label") for n in json.loads(first.read_text())["nodes"]}
+    assert labels.get("b_ja") == "日本語クラス"
+
+
 def test_to_json_commit_fallback_uses_output_repo_not_cwd(tmp_path, monkeypatch):
     # Without an explicit built_at_commit, provenance must come from the repo
     # the graph is written into, not from whatever repo the shell happens to
@@ -371,6 +449,13 @@ def _vis_nodes_from_html(content: str) -> list:
     return json.loads(m.group(1).replace("<\\/", "</"))
 
 
+def _vis_edges_from_html(content: str) -> list:
+    """Extract the RAW_EDGES JSON array embedded in the generated HTML."""
+    m = re.search(r"const RAW_EDGES = (\[.*?\]);", content, re.DOTALL)
+    assert m, "RAW_EDGES not found in HTML"
+    return json.loads(m.group(1).replace("<\\/", "</"))
+
+
 def test_to_html_annotated_node_gets_learning_status_and_ring():
     """A node with an overlay entry gets learning_status + learning_stale fields,
     a status-colored ring (border), and a Lesson line in its hover title."""
@@ -431,6 +516,72 @@ def test_to_html_unannotated_identical_to_pre_feature():
         cb = b.read_text().replace("b.html", "X.html")
     assert ca == cb
     assert "learning_status" not in ca
+
+
+def test_to_html_tooltips_preserve_special_characters_without_html_entities(tmp_path):
+    """Issue #3664: Node and edge hover tooltips (vis-network title) must preserve
+    raw characters (&, ', ", <, >) without HTML entity escaping (&amp;, &#x27;, etc.)
+    because vis-network renders title via innerText rather than innerHTML."""
+    import networkx as nx
+    G = nx.Graph()
+    G.add_node("n1", label="B-Roll & Filming", source_file="src/a.py", community=0)
+    G.add_node("n2", label="Anna's content batching schedule", source_file="src/b.py", community=0)
+    G.add_node("n3", label='<Widget prop="value" & count > 0>', source_file="src/c.py", community=0)
+    G.add_edge("n1", "n2", relation="reviews & approves", confidence="EXTRACTED")
+    G.add_edge("n2", "n3", relation="calls <indirect>", confidence="INFERRED")
+
+    labels = {0: "Team A & Team B"}
+    out = tmp_path / "graph.html"
+    to_html(G, {0: ["n1", "n2", "n3"]}, str(out), community_labels=labels)
+    content = out.read_text(encoding="utf-8")
+
+    nodes = {n["id"]: n for n in _vis_nodes_from_html(content)}
+    assert nodes["n1"]["title"] == "B-Roll & Filming"
+    assert "&amp;" not in nodes["n1"]["title"]
+
+    assert nodes["n2"]["title"] == "Anna's content batching schedule"
+    assert "&#x27;" not in nodes["n2"]["title"]
+    assert "&#39;" not in nodes["n2"]["title"]
+
+    assert nodes["n3"]["title"] == '<Widget prop="value" & count > 0>'
+    for entity in ("&lt;", "&gt;", "&quot;", "&amp;"):
+        assert entity not in nodes["n3"]["title"]
+
+    edges = _vis_edges_from_html(content)
+    edge_map = {(e["from"], e["to"]): e for e in edges}
+    e1 = edge_map[("n1", "n2")]
+    assert e1["title"] == "reviews & approves [EXTRACTED]"
+    assert "&amp;" not in e1["title"]
+
+    e2 = edge_map[("n2", "n3")]
+    assert e2["title"] == "calls <indirect> [INFERRED]"
+    assert "&lt;" not in e2["title"]
+    assert "&gt;" not in e2["title"]
+
+    # In contrast, legend items are injected into innerHTML and MUST remain HTML-escaped.
+    assert "Team A &amp; Team B" in content
+
+
+def test_to_html_learning_overlay_tooltip_preserves_special_characters(tmp_path):
+    """Issue #3664: Node with learning overlay preserves special characters in both
+    the label and lesson text without HTML entity escaping."""
+    import networkx as nx
+    G = nx.Graph()
+    G.add_node("n1", label="Anna's & Bob's <Pipeline>", source_file="src/a.py", community=0)
+    overlay = {
+        "n1": {"status": "contested", "uses": 2, "neg": 1, "stale": True}
+    }
+
+    out = tmp_path / "graph.html"
+    to_html(G, {0: ["n1"]}, str(out), learning_overlay=overlay)
+    content = out.read_text(encoding="utf-8")
+
+    nodes = {n["id"]: n for n in _vis_nodes_from_html(content)}
+    title = nodes["n1"]["title"]
+    assert "Anna's & Bob's <Pipeline>\n" in title
+    assert "Lesson: contested (useful 2 / dead-end 1) [code changed — re-verify]" in title
+    for entity in ("&amp;", "&#x27;", "&#39;", "&lt;", "&gt;"):
+        assert entity not in title
 
 
 def test_to_canvas_file_paths_relative_to_vault():
@@ -1026,3 +1177,40 @@ console.log(bad);
         proc = subprocess.run([node, str(js)], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "0", f"geometry violations: {proc.stdout.strip()}"
+
+
+def test_to_html_pins_vis_network_version_for_tooltip_xss_boundary():
+    """Tooltip `title` is passed to vis-network as a STRING and rendered via
+    Popup.setText -> innerText (verified in the 9.1.6 bundle), so tooltips are
+    intentionally NOT html-escaped (#3664/#3686). That safety rests on the pin:
+    if vis-network is bumped, the innerText rendering path (the #1838 stored-XSS
+    boundary) must be re-verified. This guard fails CI on a silent bump."""
+    G = make_graph()
+    communities = cluster(G)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "graph.html"
+        to_html(G, communities, str(out))
+        content = out.read_text()
+        assert "vis-network@9.1.6" in content, (
+            "vis-network pin changed — re-verify Popup.setText renders a string "
+            "title via innerText (not innerHTML) before updating this pin, or the "
+            "un-escaped tooltip (#3686) reopens the #1838 stored-XSS boundary"
+        )
+
+
+def test_to_html_spiral_seed_uses_a_real_map_index():
+    """#3699: the Fermat-spiral seed positions reference `i`, so the node map
+    MUST bind an index (`RAW_NODES.map((n, i) => ...)`). Without it the emitted
+    JS throws `ReferenceError: i is not defined` and graph.html fails to render
+    at every graph size. Guards against the free-`i` regression."""
+    G = make_graph()
+    communities = cluster(G)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "graph.html"
+        to_html(G, communities, str(out))
+        content = out.read_text()
+        if "Math.sqrt(i)" in content:  # spiral seed present
+            assert "RAW_NODES.map((n, i)" in content, (
+                "spiral seed references `i` but the node map has no index param "
+                "-> ReferenceError: i is not defined (#3699)"
+            )
