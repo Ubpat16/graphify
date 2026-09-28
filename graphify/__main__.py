@@ -822,6 +822,12 @@ def _run_cli() -> None:
 
     if dispatch_install_cli(cmd):
         return
+    # Installation and help commands do not need provider credentials. Load
+    # project-local configuration only for commands that continue into runtime
+    # operations, so an unrelated or nonstandard .env cannot pollute setup.
+    from graphify.config import load_project_environment
+
+    load_project_environment()
     dispatch_command(cmd)
 
 

@@ -14,8 +14,11 @@ from typing import NamedTuple
 import networkx as nx
 from networkx.readwrite import json_graph
 from graphify.security import sanitize_label, check_graph_file_size_cap, _CONTROL_CHAR_RE
+from graphify.config import load_project_environment
 from graphify.build import edge_data, edge_datas
 from graphify.paths import default_graph_json as _default_graph_json
+
+load_project_environment()
 
 try:
     with warnings.catch_warnings():
